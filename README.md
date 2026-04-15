@@ -45,7 +45,7 @@ BASE='https://192.168.1.1/API/1.0'
 curl -k -u "$AUTH" "$BASE/VoIP"
 curl -k -u "$AUTH" "$BASE/VoIP/SIP"
 curl -k -u "$AUTH" "$BASE/VoIP/SIP/Lines"
-curl -k -u "$AUTH" "$BASE/VoIP/SIP/Lines/%2B34960712434"
+curl -k -u "$AUTH" "$BASE/VoIP/SIP/Lines/%2B34960000000"
 curl -k -u "$AUTH" "https://192.168.1.1/API/WAN"
 ```
 
