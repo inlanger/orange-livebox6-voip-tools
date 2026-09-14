@@ -55,6 +55,8 @@ The SIP password is hidden in terminal output by default. The generated file con
 
 ## Browser / Network Notes
 
+- Run the bridge through your Orange home connection first. In our test, the same bridge image and credentials registered successfully from home but received no SIP responses from either Orange proxy address on an OVH VPS. Both proxies also accepted TCP connections from home but timed out from the VPS; another SIP service was reachable from the VPS.
+- This suggests a source-network restriction. It does not establish whether Orange requires the original subscriber line, allows other Orange connections, or whether the failure is specific to the OVH route. Extracted credentials alone do not guarantee registration from a remote server.
 - The Livebox certificate is self-signed. Browsers often show `ERR_CERT_INVALID`.
 - The scripts use HTTPS with certificate verification disabled on purpose for local extraction.
 - If your main router and Livebox both use `192.168.1.1`, isolate the Livebox or make sure your Ethernet interface is routed directly to it.
