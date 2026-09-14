@@ -1,3 +1,5 @@
+![Orange VoIP bridge connecting two simultaneous phone calls](assets/readme-banner.png)
+
 # Orange Livebox 6 VoIP Tools
 
 Dependency-free Python tools for Orange Spain: extract `Livebox 6` SIP credentials, check registration, and bridge incoming and outgoing calls to a SIP server.
