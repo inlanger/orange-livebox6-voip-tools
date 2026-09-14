@@ -117,58 +117,32 @@ class CallLifecycleTests(unittest.TestCase):
         self.assertEqual(self.downstream()[-1].method, 'ACK')
         self.assertEqual(sum(p.method == 'BYE' for p in self.downstream()), 1)
 
-    def test_accepted_inbound_survives_five_minutes_without_sip_then_handles_bye(self):
+    def test_both_accepted_calls_survive_five_minutes_then_end_independently(self):
         b = self.b
-        request = self.request(call_id='incoming')
-        calls = 0
-        def ready(*_):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                invite = self.upstream()[-1]
-                b.sock.recvfrom.return_value = (self.response(invite, 200, [('Contact', '<sip:agent@example>')]).to_bytes(), ('127.0.0.1', 5060))
-                return ([b.sock], [], [])
-            if calls == 2:
-                answer = next(p for p in self.downstream() if p.is_response and p.status_code == 200)
-                ack = self.request('ACK', call_id='incoming', branch='z9hG4bKack', to_tag=';tag=' + proxy.extract_tag(answer.get('To')))
-                b.downstream_sock.recvfrom.return_value = (ack.to_bytes(), ('127.0.0.1', 5060))
-                return ([b.downstream_sock], [], [])
-            if calls == 3:
-                self.clock = 301
-                return ([], [], [])
-            self.clock = 302
-            bye = self.request('BYE', call_id='incoming', seq=2, branch='z9hG4bKbye')
-            b.downstream_sock.recvfrom.return_value = (bye.to_bytes(), ('127.0.0.1', 5060))
-            return ([b.downstream_sock], [], [])
-        with patch.object(proxy.select, 'select', ready):
-            b.handle_inbound_invite(request, ('127.0.0.1', 5060))
-        self.assertEqual(self.clock, 302)
-        self.assertEqual(self.upstream()[-1].method, 'BYE')
-
-    def test_accepted_outbound_survives_five_minutes_without_sip_then_handles_bye(self):
-        calls = 0
-        def ready(*_):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                invite = self.downstream()[-1]
-                self.b.downstream_sock.recvfrom.return_value = (self.response(invite, 200).to_bytes(), ('127.0.0.1', 5060))
-                return ([self.b.downstream_sock], [], [])
-            if calls == 2:
-                answer = next(p for p in self.upstream() if p.is_response and p.status_code == 200)
-                ack = self.request('ACK', branch='z9hG4bKack', to_tag=';tag=' + proxy.extract_tag(answer.get('To')))
-                self.b.sock.recvfrom.return_value = (ack.to_bytes(), ('127.0.0.1', 6000))
-                return ([self.b.sock], [], [])
-            if calls == 3:
-                self.clock = 301
-                return ([], [], [])
-            self.clock = 302
-            bye = self.request('BYE', seq=2, branch='z9hG4bKbye')
-            self.b.sock.recvfrom.return_value = (bye.to_bytes(), ('127.0.0.1', 6000))
-            return ([self.b.sock], [], [])
-        with patch.object(proxy.select, 'select', ready):
-            self.b.handle_invite(self.request(), ('127.0.0.1', 6000))
-        self.assertEqual(self.clock, 302)
+        incoming = self.request(call_id='incoming')
+        outgoing = self.request(call_id='outgoing')
+        b.handle_packet(b.downstream_sock, incoming, ('127.0.0.1', 5060))
+        incoming_invite = self.upstream()[-1]
+        b.handle_packet(b.sock, outgoing, ('127.0.0.1', 6000))
+        outgoing_invite = self.downstream()[-1]
+        for sock, invite in [(b.sock, incoming_invite), (b.downstream_sock, outgoing_invite)]:
+            b.handle_packet(sock, self.response(invite, 200), ('127.0.0.1', 5060))
+        answers = {}
+        for sock, call_id, packets in [(b.downstream_sock, 'incoming', self.downstream()),
+                                       (b.sock, 'outgoing', self.upstream())]:
+            answer = next(p for p in packets if p.is_response and p.status_code == 200 and p.get('Call-ID') == call_id)
+            answers[call_id] = answer
+            ack = self.request('ACK', call_id=call_id, branch='z9hG4bKack' + call_id,
+                               to_tag=';tag=' + proxy.extract_tag(answer.get('To')))
+            b.handle_packet(sock, ack, ('127.0.0.1', 6000))
+        self.clock = 301
+        b.tick_transactions()
+        self.assertEqual(len(b.sessions), 2)
+        for sock, call_id, remaining in [(b.downstream_sock, 'incoming', 1), (b.sock, 'outgoing', 0)]:
+            bye = self.request('BYE', call_id=call_id, seq=2, branch='z9hG4bKbye' + call_id,
+                               to_tag=';tag=' + proxy.extract_tag(answers[call_id].get('To')))
+            b.handle_packet(sock, bye, ('127.0.0.1', 6000))
+            self.assertEqual(len(b.sessions), remaining)
         self.assertEqual(self.downstream()[-1].method, 'BYE')
 
     def test_final_response_retries_until_ack_and_duplicate_invite_replays_it(self):
@@ -186,6 +160,52 @@ class CallLifecycleTests(unittest.TestCase):
         self.receive(self.b.sock, session.upstream_request)
         self.assertEqual(self.upstream()[-1].to_bytes(), answer.to_bytes())
         self.assertEqual(sum(p.method == 'INVITE' for p in self.downstream()), 1)
+
+    def test_timeout_of_second_call_and_its_late_answer_do_not_end_first(self):
+        b = self.b
+        for call_id in ['first', 'second']:
+            b.handle_packet(b.downstream_sock, self.request(call_id=call_id), ('127.0.0.1', 5060))
+            invite = self.upstream()[-1]
+            if call_id == 'first':
+                b.handle_packet(b.sock, self.response(invite, 200), ('127.0.0.1', 5060))
+                answer = self.downstream()[-1]
+                ack = self.request('ACK', call_id=call_id, branch='z9hG4bKack',
+                                   to_tag=';tag=' + proxy.extract_tag(answer.get('To')))
+                b.handle_packet(b.downstream_sock, ack, ('127.0.0.1', 5060))
+            else:
+                second_invite = invite
+        self.clock = proxy.SIP_TRANSACTION_TIMEOUT
+        b.tick_transactions()
+        self.assertEqual(len(b.sessions), 1)
+        self.assertEqual(next(iter(b.sessions.values())).downstream_call_id, 'first')
+        self.assertEqual(self.downstream()[-1].status_code, 408)
+        b.handle_packet(b.sock, self.response(second_invite, 200), ('127.0.0.1', 5060))
+        self.assertEqual([p.method for p in self.upstream()][-2:], ['ACK', 'BYE'])
+        self.assertEqual(len(b.sessions), 1)
+        bye = self.request('BYE', call_id='first', seq=2, branch='z9hG4bKbye',
+                           to_tag=';tag=' + proxy.extract_tag(answer.get('To')))
+        b.handle_packet(b.downstream_sock, bye, ('127.0.0.1', 5060))
+        self.assertFalse(b.sessions)
+
+    def test_lifecycle_log_records_capacity_rejection_and_cancel_once(self):
+        b = self.b
+        b.config.max_calls = 1
+        first = self.request(call_id='first')
+        second = self.request(call_id='second')
+        cancel = self.request('CANCEL', call_id='first')
+        with self.assertLogs(proxy.LOG, level='INFO') as logs:
+            for request in [first, second, second, cancel, cancel]:
+                b.handle_packet(b.downstream_sock, request, ('127.0.0.1', 5060))
+        events = [line for line in logs.output if 'call state=' in line]
+        self.assertEqual(len(events), 3)
+        self.assertIn('state=received', events[0])
+        self.assertIn('active_calls=1', events[0])
+        self.assertIn('state=rejected', events[1])
+        self.assertIn('reason=capacity_limit', events[1])
+        self.assertIn('downstream_call_id=second', events[1])
+        self.assertIn('state=cancelled', events[2])
+        self.assertIn('active_calls=0', events[2])
+        self.assertFalse(b.sessions)
 
     def test_missing_ack_ends_both_legs_after_bounded_wait(self):
         session, invite = self.outbound()

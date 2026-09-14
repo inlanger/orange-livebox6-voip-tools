@@ -41,6 +41,7 @@ Add these settings to the file or environment when needed:
 | `ORANGE_PROXY_PUBLIC_HOST` | Address advertised in SIP headers | Local address of the route to Orange |
 | `ORANGE_REGISTER_MARGIN` | How early to refresh registration, seconds | `120` |
 | `ORANGE_PROXY_INVITE_TIMEOUT` | Setup timeout after a provisional response, seconds | `60` |
+| `ORANGE_PROXY_MAX_CALLS` | Combined limit for incoming and outgoing calls, including setup; `0` disables the software limit | `0` |
 | `ORANGE_PROXY_USER_AGENT` | SIP User-Agent value | `OrangeBridge/0.1` |
 | `ORANGE_PROXY_LOG_LEVEL` | Logging level | `INFO` |
 | `ORANGE_PROXY_TRACE_SIP` | Log full SIP messages | `false` |
@@ -67,7 +68,7 @@ Incoming: Orange -> registered bridge UDP 5070 -> SIP server UDP 5060
 Audio:    handled by the SIP server and the remote media endpoint
 ```
 
-- **One active call at a time.** This bridge is not a multi-line PBX.
+- **Concurrent calls on one registered line.** Each call has independent SIP state. The number of simultaneous conversations also depends on the Orange line and the attached SIP server; the bridge cannot increase the operator's channel capacity.
 - **UDP and IPv4 signaling.** It does not implement TCP/TLS SIP transport.
 - **No RTP relay or transcoding.** SDP is forwarded; the SIP server must provide reachable media addresses and ports. The bridge does not perform NAT traversal for audio.
 - **No authentication on the SIP-server-facing listener.** Restrict UDP `5064` to your trusted SIP server with the host firewall. It must not be exposed as a public dialing endpoint. `ORANGE_PROXY_BIND_HOST` applies to both sockets.
@@ -76,6 +77,29 @@ Audio:    handled by the SIP server and the remote media endpoint
 - Registration from another endpoint can replace the active Orange contact. Avoid running the bridge and the separate registration test client against the same line at the same time.
 
 The bridge was tested with Orange Spain and LiveKit SIP, including real incoming and outgoing calls. Other SIP servers have not been verified. The extractor's confirmed router is a Livebox 6 Sagemcom F@st 5670 with firmware 01.08.13; this is not a compatibility claim for every Orange service or router.
+
+## Call Capacity and Logs
+
+Set `ORANGE_PROXY_MAX_CALLS=2` to admit up to two incoming/outgoing calls combined. A call occupies a slot from initial admission until local cancellation, failure, or hangup. Excess initial INVITEs receive `486 Busy Here`; retransmissions receive the cached response. In-dialog requests, registration, and transaction retries do not consume new slots. There is no waiting queue.
+
+One event loop reads the two SIP sockets. Requests within a dialog are matched by socket, Call-ID, and both dialog tags, following [RFC 3261 section 12.2.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-12.2.2). CANCEL is matched to its initial transaction. Ending a call removes its active session; transaction state survives independently to handle retransmissions and late answers.
+
+Normal INFO logs contain `call state=...` lines for admitted calls and capacity rejections:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `received`, `answered`, `completed`, `cancelled`, `rejected`, `timeout`, or `failed` |
+| `direction` | `inbound` from Orange or `outbound` from the attached SIP server |
+| `upstream_call_id` | Call-ID on the attached SIP server leg |
+| `downstream_call_id` | Call-ID on the Orange leg |
+| `active_calls` | Calls currently admitted, after this state change |
+| `max_calls` | Configured software limit; `0` means no software limit |
+| `reason` | `capacity_limit`, `orange_cancel`, `application_cancel`, `orange_bye`, `application_bye`, `invite_timeout`, `ack_timeout`, `invalid_auth_challenge`, `peer_response`, or `-` |
+| `sip_status` | Related SIP status when available; `0` when not applicable |
+
+The log timestamp marks when the bridge observed the transition. `received` means admitted for forwarding; `answered` means the far end returned 200 and the bridge forwarded the answer. Capacity rejections have a terminal line without admission. Both leg IDs are allocated before the capacity check, so a generated ID in a rejection log does not mean an INVITE was sent on that leg. Cancellation and terminal transitions are logged once per session; SIP retries have separate transaction logs.
+
+`orange_cancel` means Orange sent CANCEL. It does not establish whether a person hung up or the operator cancelled setup. `invite_timeout` can result from a peer's 408 or the bridge's transaction timer. A `completed` event marks local hangup handling; ACK/BYE retries may still be pending. These are diagnostic logs, with no HTTP delivery, persistence, or replay guarantee. Integration with an application's call history is separate.
 
 ## Optional Docker Usage
 
@@ -116,4 +140,4 @@ python3 -m unittest discover -s orange-proxy/tests -v
 python3 -m unittest discover -s tests -v
 ```
 
-Tests cover registration refresh during a call, retransmitted and failed INVITEs, ACK matching by dialog tags, cancellation racing with an answer, missing ACKs, and retried BYEs. They use synthetic credentials and local UDP peers, with no operator connection or telephone calls.
+Tests cover concurrent incoming/outgoing calls, distinct SDP forwarding, shared capacity, independent cancellation/hangup/timeouts, registration refresh during calls, retransmitted and failed INVITEs, ACK matching by dialog tags, cancellation racing with an answer, missing ACKs, and retried BYEs. They use synthetic credentials and local UDP peers, with no operator connection or telephone calls. Concurrent SIP signaling in these tests does not verify simultaneous audio conversations on a particular Orange account.

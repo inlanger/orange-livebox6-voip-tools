@@ -11,6 +11,7 @@ import select
 import socket
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -47,7 +48,7 @@ def new_tag(length: int = 8) -> str:
 
 
 def new_call_id(suffix: str) -> str:
-    return f"{int(time.time())}-{random.randint(1000, 9999)}@{suffix}"
+    return f"{uuid.uuid4().hex}@{suffix}"
 
 
 def normalize_header_name(name: str) -> str:
@@ -395,6 +396,11 @@ class BridgeConfig:
     invite_timeout: int
     user_agent: str
     trace_sip: bool
+    max_calls: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_calls < 0:
+            raise ValueError("ORANGE_PROXY_MAX_CALLS must be zero or positive")
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -425,6 +431,7 @@ class BridgeConfig:
             invite_timeout=env_int("ORANGE_PROXY_INVITE_TIMEOUT", 60),
             user_agent=os.environ.get("ORANGE_PROXY_USER_AGENT", "OrangeBridge/0.1").strip(),
             trace_sip=env_bool("ORANGE_PROXY_TRACE_SIP", False),
+            max_calls=env_int("ORANGE_PROXY_MAX_CALLS", 0),
         )
 
 
@@ -571,6 +578,7 @@ class OrangeSIPBridge:
         self.register_retry_at = 0.0
         self.client_transactions: dict[tuple, ClientTransaction] = {}
         self.server_transactions: dict[tuple, ServerTransaction] = {}
+        self.sessions: dict[tuple, CallSession | InboundCallSession] = {}
         self.advertised_host = config.public_host or self._discover_advertised_host()
 
     @staticmethod
@@ -727,7 +735,9 @@ class OrangeSIPBridge:
     def receive_call_response(self, session, response: SIPMessage) -> None:
         handler = self.handle_downstream_response if isinstance(session, CallSession) else self.handle_upstream_response
         if handler(session, response):
-            session.finished = True
+            code = response.status_code
+            state = "timeout" if code == 408 else "rejected" if 300 <= code < 500 else "failed"
+            self.finish_call(session, state, "invite_timeout" if code == 408 else "peer_response", code)
 
     def end_unacknowledged_call(self, session) -> None:
         if session.finished:
@@ -739,7 +749,7 @@ class OrangeSIPBridge:
         else:
             self.send_upstream_bye_inbound(session)
             self.send_downstream_bye_inbound(session)
-        session.finished = True
+        self.finish_call(session, "failed", "ack_timeout")
 
     def log_sip(self, label: str, message: SIPMessage) -> None:
         if not self.config.trace_sip:
@@ -776,93 +786,105 @@ class OrangeSIPBridge:
                 LOG.exception("background register refresh failed")
             self.tick_transactions()
             ready, _, _ = select.select([self.sock, self.downstream_sock], [], [], 0.25)
-            if not ready:
-                continue
             for active_sock in ready:
-                if active_sock is self.sock:
-                    data, addr = self.sock.recvfrom(MAX_PACKET)
-                    try:
-                        message = parse_sip_message(data)
-                    except Exception:
-                        LOG.exception("failed to parse packet from %s:%s", addr[0], addr[1])
-                        continue
-                    if self.handle_transaction_packet(self.sock, message, addr):
-                        continue
-                    if message.is_response:
-                        LOG.debug("dropping unsolicited response %s from %s:%s", message.start_line, addr[0], addr[1])
-                        continue
-                    method = message.method.upper()
-                    if method == "OPTIONS":
-                        response = build_response(
-                            message,
-                            200,
-                            "OK",
-                            message.get("To") or "",
-                            extra_headers=[
-                                ("Allow", ALLOWED_METHODS),
-                                ("User-Agent", self.config.user_agent),
-                            ],
-                        )
-                        self.send_upstream(response, addr)
-                        continue
-                    if method != "INVITE":
-                        response = build_response(
-                            message,
-                            405,
-                            "Method Not Allowed",
-                            message.get("To") or "",
-                            extra_headers=[
-                                ("Allow", ALLOWED_METHODS),
-                                ("User-Agent", self.config.user_agent),
-                            ],
-                        )
-                        self.send_upstream(response, addr)
-                        continue
-                    self.handle_invite(message, addr)
-                    continue
-
-                data, addr = self.downstream_sock.recvfrom(MAX_PACKET)
+                data, addr = active_sock.recvfrom(MAX_PACKET)
                 try:
                     message = parse_sip_message(data)
-                except Exception:
-                    LOG.exception("failed to parse packet from Orange %s:%s", addr[0], addr[1])
-                    continue
-                if self.handle_registration_response(message):
-                    continue
-                if self.handle_transaction_packet(self.downstream_sock, message, addr):
-                    continue
-                if message.is_response:
-                    LOG.debug("dropping unsolicited downstream response %s", message.start_line)
-                    continue
-                method = message.method.upper()
-                if method == "OPTIONS":
-                    response = build_response(
-                        message,
-                        200,
-                        "OK",
-                        message.get("To") or "",
-                        extra_headers=[
-                            ("Allow", ALLOWED_METHODS),
-                            ("User-Agent", self.config.user_agent),
-                        ],
-                    )
-                    self.send_downstream(response)
-                    continue
-                if method != "INVITE":
-                    response = build_response(
-                        message,
-                        405,
-                        "Method Not Allowed",
-                        message.get("To") or "",
-                        extra_headers=[
-                            ("Allow", ALLOWED_METHODS),
-                            ("User-Agent", self.config.user_agent),
-                        ],
-                    )
-                    self.send_downstream(response)
-                    continue
+                    self.handle_packet(active_sock, message, addr)
+                except (ValueError, IndexError):
+                    LOG.exception("invalid SIP packet from %s:%s", addr[0], addr[1])
+
+    def handle_packet(self, sock, message: SIPMessage, addr: tuple[str, int]) -> None:
+        if sock is self.downstream_sock and self.handle_registration_response(message):
+            return
+        if self.handle_transaction_packet(sock, message, addr):
+            return
+        if message.is_response:
+            LOG.debug("dropping unsolicited response %s", message.start_line)
+            return
+
+        method = message.method.upper()
+        session = self.find_session(sock, message)
+        if session is not None:
+            if isinstance(session, CallSession):
+                handler = self.handle_upstream_request if sock is self.sock else self.handle_downstream_request
+                handler(session, message, addr)
+            elif sock is self.sock:
+                self.handle_upstream_request_inbound(session, message, addr)
+            else:
+                self.handle_downstream_request_inbound(session, message)
+            return
+
+        if method == "OPTIONS":
+            code, reason = 200, "OK"
+        elif extract_tag(message.get("To")) or method in {"BYE", "CANCEL"}:
+            code, reason = 481, "Call/Transaction Does Not Exist"
+        elif method == "INVITE":
+            if sock is self.sock:
+                self.handle_invite(message, addr)
+            else:
                 self.log_sip("Orange -> proxy inbound INVITE", message)
                 self.handle_inbound_invite(message, addr)
+            return
+        else:
+            code, reason = 405, "Method Not Allowed"
+        response = build_response(message, code, reason, message.get("To") or "",
+                                  extra_headers=[("Allow", ALLOWED_METHODS), ("User-Agent", self.config.user_agent)])
+        self.send_sip(sock, response, None if sock is self.downstream_sock else addr)
+
+    def find_session(self, sock, request: SIPMessage):
+        # CANCEL matches the initial transaction; in-dialog requests match both tags.
+        for key, session in self.sessions.items():
+            if request.method == "CANCEL":
+                if key == transaction_key(sock, request, "INVITE"):
+                    return session
+                continue
+            if sock is self.sock:
+                call_id = session.upstream_call_id
+                if isinstance(session, CallSession):
+                    local_tag, remote_tag = session.upstream_tag, extract_tag(session.upstream_from)
+                else:
+                    local_tag, remote_tag = extract_tag(session.upstream_from), session.upstream_to_tag
+            else:
+                call_id = session.downstream_call_id
+                if isinstance(session, CallSession):
+                    local_tag, remote_tag = session.downstream_from_tag, session.downstream_to_tag
+                else:
+                    local_tag, remote_tag = session.downstream_to_tag, extract_tag(session.downstream_request.get("From"))
+            if (request.get("Call-ID") == call_id and local_tag is not None
+                    and extract_tag(request.get("To")) == local_tag
+                    and extract_tag(request.get("From")) == remote_tag):
+                return session
+        return None
+
+    def add_session(self, session) -> bool:
+        sock = self.sock if isinstance(session, CallSession) else self.downstream_sock
+        request = session.upstream_request if isinstance(session, CallSession) else session.downstream_request
+        if self.config.max_calls and len(self.sessions) >= self.config.max_calls:
+            response = build_response(request, 486, "Busy Here", with_tag(request.get("To") or "", new_tag()))
+            self.send_sip(sock, response, session.upstream_addr if sock is self.sock else None)
+            self.finish_call(session, "rejected", "capacity_limit", 486)
+            return False
+        self.sessions[transaction_key(sock, request)] = session
+        self.log_call_state(session, "received")
+        return True
+
+    def log_call_state(self, session, state: str, reason: str = "", sip_status: int = 0) -> None:
+        LOG.info("call state=%s direction=%s upstream_call_id=%s downstream_call_id=%s "
+                 "active_calls=%s max_calls=%s reason=%s sip_status=%s",
+                 state, "outbound" if isinstance(session, CallSession) else "inbound",
+                 session.upstream_call_id, session.downstream_call_id, len(self.sessions),
+                 self.config.max_calls, reason or "-", sip_status)
+
+    def finish_call(self, session, state: str, reason: str, sip_status: int = 0) -> None:
+        if session.finished:
+            return
+        session.finished = True
+        sock = self.sock if isinstance(session, CallSession) else self.downstream_sock
+        request = session.upstream_request if isinstance(session, CallSession) else session.downstream_request
+        self.sessions.pop(transaction_key(sock, request), None)
+        # Transaction callbacks and ACK/BYE caches keep their own lifetimes.
+        self.log_call_state(session, state, reason, sip_status)
 
     def handle_invite(self, upstream_request: SIPMessage, upstream_addr: tuple[str, int]) -> None:
         trying = build_response(upstream_request, 100, "Trying", upstream_request.get("To") or "")
@@ -912,69 +934,8 @@ class OrangeSIPBridge:
             downstream_route_headers=[self.register_state.service_route] if self.register_state.service_route else [],
         )
 
-        self.send_downstream_invite(session)
-
-        while True:
-            self.ensure_registered()
-            self.tick_transactions()
-            if session.finished:
-                return
-            ready, _, _ = select.select([self.sock, self.downstream_sock], [], [], 0.25)
-            if not ready:
-                continue
-
-            for active_sock in ready:
-                data, addr = active_sock.recvfrom(MAX_PACKET)
-                try:
-                    message = parse_sip_message(data)
-                except Exception:
-                    LOG.exception("failed to parse packet during active call")
-                    continue
-
-                if active_sock is self.downstream_sock and self.handle_registration_response(message):
-                    continue
-
-                if self.handle_transaction_packet(active_sock, message, addr):
-                    if session.finished:
-                        return
-                    continue
-
-                call_id = message.get("Call-ID") or ""
-                if active_sock is self.downstream_sock:
-                    if call_id == session.downstream_call_id:
-                        if message.is_response:
-                            if self.handle_downstream_response(session, message):
-                                return
-                        else:
-                            if self.handle_downstream_request(session, message, addr):
-                                return
-                        continue
-
-                    if not message.is_response and message.method.upper() == "OPTIONS":
-                        response = build_response(
-                            message,
-                            200,
-                            "OK",
-                            message.get("To") or "",
-                            extra_headers=[("Allow", ALLOWED_METHODS), ("User-Agent", self.config.user_agent)],
-                        )
-                        self.send_downstream(response)
-                    continue
-
-                if call_id == session.upstream_call_id and not message.is_response:
-                    if self.handle_upstream_request(session, message, addr):
-                        return
-                    continue
-
-                if not message.is_response and message.method.upper() == "OPTIONS":
-                    response = build_response(
-                        message,
-                        200,
-                        "OK",
-                        message.get("To") or "",
-                        extra_headers=[("Allow", ALLOWED_METHODS), ("User-Agent", self.config.user_agent)],
-                    )
-                    self.send_upstream(response, addr)
+        if self.add_session(session):
+            self.send_downstream_invite(session)
 
     def handle_inbound_invite(self, downstream_request: SIPMessage, downstream_addr: tuple[str, int]) -> None:
         trying = build_response(downstream_request, 100, "Trying", downstream_request.get("To") or "")
@@ -1022,6 +983,9 @@ class OrangeSIPBridge:
             upstream_remote_target=upstream_request_uri,
         )
 
+        if not self.add_session(session):
+            return
+
         LOG.info("accepting Orange inbound number=%s call_id=%s", called_number, session.downstream_call_id)
         LOG.info(
             "inbound registration clock call_id=%s expires_at=%.3f remaining=%.3fs refresh_margin=%ss",
@@ -1032,88 +996,6 @@ class OrangeSIPBridge:
         )
         self.send_upstream(upstream_request.to_bytes(), (self.config.upstream_host, self.config.upstream_port),
                            on_response=lambda response: self.receive_call_response(session, response))
-        registration_refresh_reported = False
-        registration_expiry_reported = False
-
-        while True:
-            self.ensure_registered()
-            remaining = self.register_state.valid_until - time.time()
-            if remaining <= self.config.register_margin and not registration_refresh_reported:
-                LOG.warning("registration refresh due during inbound call call_id=%s remaining=%.3fs", session.downstream_call_id, remaining)
-                registration_refresh_reported = True
-            if remaining <= 0 and not registration_expiry_reported:
-                LOG.warning("registration expired during inbound call call_id=%s", session.downstream_call_id)
-                registration_expiry_reported = True
-            self.tick_transactions()
-            if session.finished:
-                return
-            ready, _, _ = select.select([self.sock, self.downstream_sock], [], [], 0.25)
-            if not ready:
-                continue
-
-            for active_sock in ready:
-                data, addr = active_sock.recvfrom(MAX_PACKET)
-                try:
-                    message = parse_sip_message(data)
-                except Exception:
-                    LOG.exception("failed to parse packet during inbound call")
-                    continue
-
-                if active_sock is self.downstream_sock and self.handle_registration_response(message):
-                    continue
-
-                if self.handle_transaction_packet(active_sock, message, addr):
-                    if session.finished:
-                        return
-                    continue
-
-                call_id = message.get("Call-ID") or ""
-                LOG.info(
-                    "inbound packet source=%s:%s local_port=%s start=%s call_id=%s cseq=%s matched_dialog=%s",
-                    addr[0], addr[1], active_sock.getsockname()[1], message.start_line,
-                    call_id, message.get("CSeq"),
-                    call_id == (session.upstream_call_id if active_sock is self.sock else session.downstream_call_id),
-                )
-                if call_id not in {session.upstream_call_id, session.downstream_call_id}:
-                    self.log_sip("inbound packet outside active dialog", message)
-                if active_sock is self.sock:
-                    if call_id != session.upstream_call_id:
-                        if not message.is_response and message.method.upper() == "OPTIONS":
-                            response = build_response(
-                                message,
-                                200,
-                                "OK",
-                                message.get("To") or "",
-                                extra_headers=[("Allow", ALLOWED_METHODS), ("User-Agent", self.config.user_agent)],
-                            )
-                            self.send_upstream(response, addr)
-                        continue
-                    if message.is_response:
-                        if self.handle_upstream_response(session, message):
-                            return
-                    else:
-                        if self.handle_upstream_request_inbound(session, message, addr):
-                            return
-                    continue
-
-                if call_id != session.downstream_call_id:
-                    if not message.is_response and message.method.upper() == "OPTIONS":
-                        response = build_response(
-                            message,
-                            200,
-                            "OK",
-                            message.get("To") or "",
-                            extra_headers=[("Allow", ALLOWED_METHODS), ("User-Agent", self.config.user_agent)],
-                        )
-                        self.send_downstream(response)
-                    continue
-
-                if message.is_response:
-                    if self.handle_downstream_response_inbound(session, message):
-                        return
-                else:
-                    if self.handle_downstream_request_inbound(session, message):
-                        return
 
     def ensure_registered(self) -> None:
         """Advance REGISTER without reading the socket or blocking the call loop."""
@@ -1289,6 +1171,7 @@ class OrangeSIPBridge:
                 header_name, params = digest_challenge(response)
                 if not header_name or not params or not params.get("realm") or not params.get("nonce"):
                     self.forward_downstream_failure(session, 502, "Orange auth challenge parse failed", b"")
+                    self.finish_call(session, "failed", "invalid_auth_challenge", 502)
                     return True
                 auth = build_digest_auth(
                     header_name,
@@ -1320,6 +1203,7 @@ class OrangeSIPBridge:
                     self.send_downstream_bye(session)
                     return True
                 self.forward_answer(session, response)
+                self.log_call_state(session, "answered", sip_status=code)
                 return False
 
             if not session.cancelled:
@@ -1427,7 +1311,7 @@ class OrangeSIPBridge:
                 extra_headers=[("User-Agent", self.config.user_agent)],
             )
             self.send_upstream(cancelled, session.upstream_addr)
-            session.finished = True
+            self.finish_call(session, "cancelled", "application_cancel", 487)
             return True
 
         if method == "BYE" and session.answered:
@@ -1440,7 +1324,7 @@ class OrangeSIPBridge:
             )
             self.send_upstream(ok, addr)
             self.send_downstream_bye(session)
-            session.finished = True
+            self.finish_call(session, "completed", "application_bye")
             return True
 
         if method == "OPTIONS":
@@ -1484,7 +1368,7 @@ class OrangeSIPBridge:
             self.send_downstream(ok)
             if session.answered:
                 self.send_upstream_bye(session)
-            session.finished = True
+            self.finish_call(session, "completed", "orange_bye")
             return True
 
         if method == "OPTIONS":
@@ -1663,6 +1547,7 @@ class OrangeSIPBridge:
                     self.send_upstream_bye_inbound(session)
                     return True
                 self.forward_upstream_answer(session, response)
+                self.log_call_state(session, "answered", sip_status=code)
                 return False
 
             if not session.downstream_cancelled:
@@ -1765,7 +1650,7 @@ class OrangeSIPBridge:
             )
             self.send_upstream(ok, addr)
             self.send_downstream_bye_inbound(session)
-            session.finished = True
+            self.finish_call(session, "completed", "application_bye")
             return True
 
         if method == "OPTIONS":
@@ -1809,7 +1694,7 @@ class OrangeSIPBridge:
             session.downstream_cancelled = True
             self.send_upstream_cancel_inbound(session)
             self.forward_upstream_failure(session, 487, "Request Terminated", b"")
-            session.finished = True
+            self.finish_call(session, "cancelled", "orange_cancel", 487)
             return True
 
         if method == "BYE" and session.answered:
@@ -1822,7 +1707,7 @@ class OrangeSIPBridge:
             )
             self.send_downstream(ok)
             self.send_upstream_bye_inbound(session)
-            session.finished = True
+            self.finish_call(session, "completed", "orange_bye")
             return True
 
         if method == "OPTIONS":
@@ -1844,13 +1729,6 @@ class OrangeSIPBridge:
             extra_headers=[("User-Agent", self.config.user_agent)],
         )
         self.send_downstream(not_impl)
-        return False
-
-    def handle_downstream_response_inbound(self, session: InboundCallSession, response: SIPMessage) -> bool:
-        self.log_sip("Orange -> proxy inbound response", response)
-        _cseq_number, cseq_method = parse_cseq(response.get("CSeq"))
-        if cseq_method == "BYE":
-            return True
         return False
 
     def send_upstream_ack_inbound(self, session: InboundCallSession) -> None:

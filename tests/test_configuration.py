@@ -82,6 +82,15 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn(self.line['authPassword'], output.getvalue())
         self.assertIn('ORANGE_SIP_PASSWORD=<redacted>', output.getvalue())
 
+    def test_call_limit_defaults_to_unlimited_and_accepts_positive_values(self):
+        with patch.dict(os.environ, self.values, clear=True):
+            self.assertEqual(proxy.BridgeConfig.from_env().max_calls, 0)
+            os.environ['ORANGE_PROXY_MAX_CALLS'] = '2'
+            self.assertEqual(proxy.BridgeConfig.from_env().max_calls, 2)
+            os.environ['ORANGE_PROXY_MAX_CALLS'] = '-1'
+            with self.assertRaisesRegex(ValueError, 'ORANGE_PROXY_MAX_CALLS'):
+                proxy.BridgeConfig.from_env()
+
     def test_password_can_be_shown_explicitly(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

@@ -23,6 +23,7 @@ class RegistrationTests(unittest.TestCase):
         self.bridge.register_retry_at = 0.0
         self.bridge.client_transactions = {}
         self.bridge.server_transactions = {}
+        self.bridge.sessions = {}
         self.clock = 0.0
         for name in ('time', 'monotonic'):
             p = patch.object(proxy.time, name, lambda: self.clock)
@@ -78,44 +79,32 @@ class RegistrationTests(unittest.TestCase):
         self.bridge.ensure_registered()
         self.assertIsNotNone(self.bridge.register_transaction)
 
-    def test_active_inbound_call_renews_before_old_expiry_and_still_handles_bye(self):
+    def test_two_active_calls_keep_processing_during_registration_refresh(self):
         b = self.bridge
-        request = proxy.SIPMessage('INVITE sip:+1000@example SIP/2.0', [('Call-ID', 'orange-call'), ('CSeq', '1 INVITE'), ('To', '<sip:+1000@example>'), ('From', '<sip:caller@example>;tag=t')], b'')
-        bye = proxy.SIPMessage('BYE sip:+1000@example SIP/2.0', [('Call-ID', 'orange-call'), ('CSeq', '12 BYE')], b'')
-        b.handle_downstream_request_inbound = Mock(return_value=True)
-        renewed_at = []
-        call_packets = 0
-        def ready(*_):
-            nonlocal call_packets
-            if call_packets == 0:
-                invite = proxy.parse_sip_message(b.sock.sendto.call_args.args[0])
-                answer = proxy.build_response(invite, 200, "OK", proxy.with_tag(invite.get("To"), "agent-tag"))
-                b.sock.recvfrom.return_value = (answer, ("127.0.0.1", 5060))
-                call_packets += 1
-                return ([b.sock], [], [])
-            if call_packets == 1:
-                answer = proxy.parse_sip_message(b.downstream_sock.send.call_args.args[0])
-                ack = proxy.SIPMessage("ACK sip:+1000@example SIP/2.0", [("Call-ID", "orange-call"), ("CSeq", "1 ACK"), ("From", request.get("From")), ("To", answer.get("To"))], b"")
-                b.downstream_sock.recvfrom.return_value = (ack.to_bytes(), ("127.0.0.1", 5060))
-                call_packets += 1
-                return ([b.downstream_sock], [], [])
-            self.clock += 0.5
-            if b.register_transaction:
-                code = 401 if b.register_transaction.cseq == 1 else 200
-                b.downstream_sock.recvfrom.return_value = (self.response(code).to_bytes(), ('127.0.0.1', 5060))
-                if code == 200:
-                    renewed_at.append(self.clock)
-                return ([b.downstream_sock], [], [])
-            if self.clock >= 125:
-                b.downstream_sock.recvfrom.return_value = (bye.to_bytes(), ('127.0.0.1', 5060))
-                return ([b.downstream_sock], [], [])
-            return ([], [], [])
-        with patch.object(proxy.select, 'select', ready):
-            b.handle_inbound_invite(request, ('127.0.0.1', 5060))
-        self.assertTrue(renewed_at)
-        self.assertLess(renewed_at[0], 124)
-        self.assertGreater(b.register_state.valid_until, self.clock)
-        self.assertEqual(b.handle_downstream_request_inbound.call_args.args[1].method, 'BYE')
+        requests = [proxy.SIPMessage('INVITE sip:+1000@example SIP/2.0', [
+            ('Via', f'SIP/2.0/UDP orange.example;branch=z9hG4bK{index}'),
+            ('Call-ID', f'orange-{index}'), ('CSeq', '1 INVITE'),
+            ('To', '<sip:+1000@example>'), ('From', '<sip:caller@example>;tag=t'),
+        ], b'') for index in range(2)]
+        for request in requests:
+            b.handle_packet(b.downstream_sock, request, ('127.0.0.1', 5060))
+        self.assertEqual(len(b.sessions), 2)
+        self.clock = 4
+        b.ensure_registered()
+        b.handle_packet(b.downstream_sock, self.response(401), ('127.0.0.1', 5060))
+        # A CANCEL interleaves with the authenticated REGISTER response.
+        cancel = proxy.SIPMessage('CANCEL sip:+1000@example SIP/2.0', [
+            (k, '1 CANCEL' if k == 'CSeq' else v) for k, v in requests[0].headers
+        ], b'')
+        b.handle_packet(b.downstream_sock, cancel, ('127.0.0.1', 5060))
+        self.assertEqual(len(b.sessions), 1)
+        self.clock = 5
+        b.handle_packet(b.downstream_sock, self.response(), ('127.0.0.1', 5060))
+        self.assertEqual(b.register_state.valid_until, 3605)
+        self.assertIsNone(b.register_transaction)
+        self.assertEqual(next(iter(b.sessions.values())).downstream_call_id, 'orange-1')
+        b.downstream_sock.recvfrom.assert_not_called()
+        b.sock.recvfrom.assert_not_called()
 
 
 if __name__ == '__main__':
