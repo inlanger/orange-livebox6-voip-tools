@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import ssl
 import sys
 from pathlib import Path
@@ -50,9 +51,17 @@ def choose_line(lines: list[dict[str, Any]], requested_line: str | None) -> dict
     raise ValueError("The Livebox did not return any SIP lines.")
 
 
+def write_private_file(target: Path, content: str) -> None:
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        if os.name == 'posix':
+            os.fchmod(stream.fileno(), 0o600)
+        stream.write(content)
+
+
 def dump_json(target_dir: Path, name: str, payload: Any) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    write_private_file(target_dir / f"{name}.json", json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def build_env_map(line: dict[str, Any], sip: dict[str, Any]) -> dict[str, str]:
@@ -84,10 +93,10 @@ def build_env_map(line: dict[str, Any], sip: dict[str, Any]) -> dict[str, str]:
 
 def write_env_file(target: Path, values: dict[str, str]) -> None:
     lines = [f"{key}={value}" for key, value in values.items()]
-    target.write_text("\n".join(lines) + "\n")
+    write_private_file(target, "\n".join(lines) + "\n")
 
 
-def print_summary(line: dict[str, Any], sip: dict[str, Any], values: dict[str, str]) -> None:
+def print_summary(line: dict[str, Any], sip: dict[str, Any], values: dict[str, str], show_secrets: bool = False) -> None:
     print("Livebox SIP extraction succeeded.\n")
     print("Selected line:")
     print(f"  name:             {line.get('name')}")
@@ -102,6 +111,8 @@ def print_summary(line: dict[str, Any], sip: dict[str, Any], values: dict[str, s
     print()
     print("dotenv export:")
     for key, value in values.items():
+        if key == "ORANGE_SIP_PASSWORD" and not show_secrets:
+            value = "<redacted>"
         print(f"{key}={value}")
 
 
@@ -118,6 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line", help="Specific line name or directory number to extract.")
     parser.add_argument("--timeout", type=float, default=8.0, help="HTTP timeout in seconds.")
     parser.add_argument("--env-file", type=Path, help="Optional dotenv output path.")
+    parser.add_argument("--show-secrets", action="store_true", help="Include the SIP password in terminal output.")
     parser.add_argument("--dump-dir", type=Path, help="Optional directory where raw JSON replies are stored.")
     return parser.parse_args()
 
@@ -156,7 +168,7 @@ def main() -> int:
         dump_json(args.dump_dir, "line", line_details)
 
     env_values = build_env_map(line_details, sip)
-    print_summary(line_details, sip, env_values)
+    print_summary(line_details, sip, env_values, show_secrets=args.show_secrets)
 
     if args.env_file:
         write_env_file(args.env_file, env_values)

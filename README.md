@@ -1,6 +1,8 @@
 # Orange Livebox 6 VoIP Tools
 
-Small, dependency-free tools for Orange Spain `Livebox 6` SIP extraction and signaling tests.
+Dependency-free Python tools for Orange Spain: extract `Livebox 6` SIP credentials, check registration, and bridge incoming and outgoing calls to a SIP server.
+
+The extractor and bridge use the same credential file. The bridge runs on its own; Docker is an optional way to run it. No PBX, voice agent, or media server is bundled.
 
 This repository is based on a `Livebox 6 Sagemcom F@st 5670` with firmware `01.08.13`, where the working flow was:
 
@@ -19,7 +21,28 @@ The scripts here do not depend on `LiveboxFibraExtractor`.
 - `scripts/test_orange_sip.py`
   Raw SIP test client for `REGISTER` and short `ring-once` call tests.
 - `examples/orange_voip.env.example`
-  Example environment file consumed by the test script.
+  Example environment file for the SIP test client and bridge.
+- `orange-proxy/proxy.py`
+  Persistent SIP registration and call bridge. See the [bridge instructions](orange-proxy/README.md) for routing, configuration, and Docker usage.
+- `orange-proxy/tests/`
+  Registration, call lifecycle, and local UDP regression tests.
+- `tests/`
+  Shared configuration and credential-handling tests.
+
+## Extract and Run
+
+```bash
+python3 scripts/extract_livebox_sip.py \
+  --host 192.168.1.1 \
+  --password '<WIFI_KEY_FROM_STICKER>' \
+  --env-file .orange_voip.env
+
+python3 orange-proxy/proxy.py --env-file .orange_voip.env
+```
+
+The bridge listens for calls from your SIP server on UDP port `5064`, registers with Orange from UDP port `5070`, and forwards incoming calls to `127.0.0.1:5060`. Configure your SIP server and restrict access to the bridge's unauthenticated local listener before running it. See [routing and limitations](orange-proxy/README.md#routing-and-limitations).
+
+The SIP password is hidden in terminal output by default. The generated file contains the actual password and is saved with mode `600` on POSIX systems. Use `--show-secrets` only when you want to print the password.
 
 ## Prerequisites
 
@@ -82,13 +105,15 @@ This is optional, but useful as a sanity check:
 
 ## Extractor Usage
 
-### Print extracted values and dotenv lines
+### Print extracted values with the password hidden
 
 ```bash
 python3 scripts/extract_livebox_sip.py \
   --host 192.168.1.1 \
   --password '<WIFI_KEY_FROM_STICKER>'
 ```
+
+Add `--show-secrets` to include the SIP password in the terminal output. Use `--env-file` to create a usable credential file without printing its password.
 
 ### Write a dotenv file
 
@@ -100,6 +125,8 @@ python3 scripts/extract_livebox_sip.py \
 ```
 
 ### Dump raw JSON payloads for inspection
+
+Raw dumps include credentials. Each JSON file is saved with mode `600` on POSIX systems.
 
 ```bash
 python3 scripts/extract_livebox_sip.py \
@@ -162,3 +189,14 @@ Without the prior `REGISTER`, outbound INVITE tests can fail with `403 Forbidden
 - Treat `authUserName` and `authPassword` as secrets.
 - Do not commit real credentials into the repository.
 - Rotate or recover the line through Orange/Livebox if you leak them.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s orange-proxy/tests -v
+python3 -m unittest discover -s tests -v
+```
+
+These tests use synthetic credentials, mocks, and UDP peers on localhost. They do not contact Orange or place telephone calls. One regression test waits longer than the 32-second SIP ACK deadline, so the bridge suite takes roughly 35 seconds.
+
+GitHub Actions runs both suites on pushes and pull requests with Python 3.10 and 3.12.
