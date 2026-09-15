@@ -118,6 +118,18 @@ class UDPCallTests(unittest.TestCase):
         forwarded = self.recv(callee, method='BYE', call_id=invite.get('Call-ID'))
         self.reply(callee, callee_addr, forwarded, 200)
 
+    def test_forwarded_identity_survives_bridge_without_changing_destination(self):
+        request = self.request(self.orange, call_id='forwarded', to='<sip:+3000@example>')
+        diversion = '<sip:+3000@example>;reason=unconditional'
+        history = ['<sip:+3000@example>;index=1', '<sip:+2000@example>;index=1.1']
+        request.headers.extend([('Diversion', diversion), *[('History-Info', h) for h in history]])
+        self.orange.sendto(request.to_bytes(), self.downstream)
+        forwarded = self.recv(self.livekit, method='INVITE')
+        self.assertEqual(forwarded.get('Diversion'), diversion)
+        self.assertEqual(forwarded.get('History-Info'), ', '.join(history))
+        self.assertIn('sip:+2000@', forwarded.request_uri)
+        self.assertEqual(forwarded.get('To'), '<sip:+3000@example>')
+
     def test_two_inbound_calls_answer_and_end_independently(self):
         first, first_invite = self.start_call(self.orange, 'first')
         first_answer = self.answer_call(self.orange, first, first_invite)

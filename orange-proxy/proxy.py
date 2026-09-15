@@ -1517,6 +1517,12 @@ class OrangeSIPBridge:
             ("Content-Type", content_type),
             ("Content-Length", str(len(body))),
         ]
+        # Preserve forwarding identity. Combine repeated fields because downstream
+        # header-to-attribute mappings may expose only the first header value.
+        for name in ("Diversion", "History-Info"):
+            values = downstream_request.get_all(name)
+            if values:
+                headers.append((name, ", ".join(values)))
         return SIPMessage(
             start_line=f"INVITE {upstream_request_uri} SIP/2.0",
             headers=headers,
